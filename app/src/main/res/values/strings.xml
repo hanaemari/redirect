@@ -1,0 +1,6 @@
+<resources>
+    <string name="app_name">Redirect</string>
+    <string name="interruption_service_label">Redirect: app interruptions</string>
+    <string name="interruption_service_summary">Notices when you open an app you chose as distracting, and offers your book instead.</string>
+    <string name="interruption_service_description">Redirect uses this service only to learn which app has just come to the front, so it can step in when you open an app you marked as distracting (for example TikTok or Instagram) and show your current book instead.\n\nIt cannot read what is on your screen, does not see what you type, and nothing leaves your device. You can pause interruptions in the app, or turn this off here at any time.</string>
+</resources>

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Only window-state changes are delivered, and window content can't be read.
+    The service learns which app is in front, nothing else.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault"
+    android:canRetrieveWindowContent="false"
+    android:description="@string/interruption_service_description"
+    android:isAccessibilityTool="false"
+    android:notificationTimeout="200"
+    android:summary="@string/interruption_service_summary" />
