@@ -1,6 +1,6 @@
 package com.example.redirect.ui.rules
 
-import com.example.redirect.ui.components.AccessibilitySetupSheet
+import com.example.redirect.ui.components.AccessibilityBanner
 import com.example.redirect.ui.components.InterruptionStatusCard
 
 import androidx.compose.animation.animateContentSize
@@ -100,8 +100,6 @@ fun RulesScreen(vm: AppViewModel, data: AppData, actions: AppActions) {
     var confirmDelete by remember { mutableStateOf<RedirectRule?>(null) }
     var confirmRemoveDest by remember { mutableStateOf<Destination?>(null) }
     var showTryIt by remember { mutableStateOf(false) }
-    var showSetup by remember { mutableStateOf(false) }
-    if (showSetup) AccessibilitySetupSheet(vm, onDismiss = { showSetup = false })
 
     LazyColumn(Modifier.fillMaxSize().statusBarsPadding(), contentPadding = PaddingValues(bottom = 32.dp)) {
         item {
@@ -109,7 +107,8 @@ fun RulesScreen(vm: AppViewModel, data: AppData, actions: AppActions) {
                 FilledTonalIconButton(onClick = { actions.editRule() }) { Icon(Icons.Rounded.Add, "New rule") }
             }
         }
-        item { InterruptionStatusCard(vm, data, Modifier.padding(horizontal = 20.dp, vertical = 8.dp), onSetUp = { showSetup = true }) }
+        item { AccessibilityBanner(vm, data, Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) }
+        item { InterruptionStatusCard(vm, data, Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) }
 
         item {
             Spacer(Modifier.height(20.dp))

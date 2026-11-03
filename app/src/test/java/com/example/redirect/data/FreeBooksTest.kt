@@ -6,6 +6,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.IOException
+import kotlinx.coroutines.launch
 
 class FreeBooksTest {
 
@@ -110,15 +111,101 @@ class FreeBooksTest {
         )
     }
 
-    @Test fun catalogFallsBackToOpdsWhenGutendexFails() = kotlinx.coroutines.runBlocking {
-        val http = object : Http() {
-            override fun getText(url: String, timeoutMillis: Int): String =
-                if ("gutendex" in url) throw java.net.SocketTimeoutException("slow")
-                else "<entry><id>https://www.gutenberg.org/ebooks/84.opds</id><title>Frankenstein</title><content type=\"text\">Mary Shelley</content></entry>"
+    private val opdsPage = "<feed><link rel=\"next\" title=\"Next Page\" href=\"/ebooks/search.opds/?query=frankenstein&amp;start_index=26\"/>" +
+        "<entry><id>https://www.gutenberg.org/ebooks/84.opds</id><title>Frankenstein</title><content type=\"text\">Mary Shelley</content></entry></feed>"
+
+    /** Records requested URLs; answers OPDS with [opdsPage] unless told gutenberg.org is down. */
+    private class FakeHttp(val opds: String, val gutenbergDown: Boolean = false, val gutendex: String = "") : Http() {
+        val requested = mutableListOf<String>()
+        override fun getText(url: String, timeoutMillis: Int, call: Call?): String {
+            synchronized(requested) { requested += url }
+            return when {
+                "gutendex" in url -> gutendex.ifEmpty { throw java.net.SocketTimeoutException("slow") }
+                gutenbergDown -> throw java.net.UnknownHostException("www.gutenberg.org")
+                else -> opds
+            }
         }
+    }
+
+    @Test fun gutenbergCatalogIsPrimaryAndGutendexIsNotCalled() = kotlinx.coroutines.runBlocking {
+        val http = FakeHttp(opdsPage)
         val page = FreeBookCatalog(http).browse("frankenstein")
         assertEquals("Project Gutenberg", page.source)
         assertEquals(84, page.books.single().gutenbergId)
-        assertNull(page.nextUrl)
+        assertEquals("https://www.gutenberg.org/ebooks/search.opds/?query=frankenstein&start_index=26", page.nextUrl)
+        assertEquals(listOf("https://www.gutenberg.org/ebooks/search.opds/?query=frankenstein"), http.requested)
+    }
+
+    @Test fun gutendexIsUsedWhenGutenbergIsUnreachable() = kotlinx.coroutines.runBlocking {
+        val http = FakeHttp(opdsPage, gutenbergDown = true, gutendex = gutendexJson)
+        val page = FreeBookCatalog(http).browse("walden")
+        assertEquals("Gutendex", page.source)
+        assertEquals(listOf(205), page.books.map { it.gutenbergId })
+    }
+
+    @Test(expected = FreeBookException::class)
+    fun bothSourcesDownIsAFriendlyError(): Unit = kotlinx.coroutines.runBlocking {
+        FreeBookCatalog(FakeHttp(opdsPage, gutenbergDown = true)).browse("x")
+        Unit
+    }
+
+    @Test fun firstPagesAreCachedOnDiskAcrossInstances() = kotlinx.coroutines.runBlocking {
+        val dir = java.nio.file.Files.createTempDirectory("discover").toFile()
+        var now = 1_000_000L
+        val first = FreeBookCatalog(FakeHttp(opdsPage), dir) { now }
+        assertNull(first.cached("Frankenstein"))
+        first.browse("Frankenstein")
+
+        // A new instance (e.g. after the app restarts) reads it from disk, case-insensitively.
+        val http = FakeHttp(opdsPage)
+        val second = FreeBookCatalog(http, dir) { now }
+        val cached = second.cached("frankenstein ")!!
+        assertEquals(84, cached.page.books.single().gutenbergId)
+        assertTrue(second.isFresh(cached))
+        assertTrue("cache read must not hit the network", http.requested.isEmpty())
+
+        now += FreeBookCatalog.FRESH_FOR_MS + 1
+        assertFalse(second.isFresh(cached))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test fun bookRecordGivesSummarySubjectsAndRights() {
+        val record = """
+            <entry><content type="xhtml"><div>
+            <p>
+            Summary:
+            "Frankenstein" is a novel &amp; more. (This is an automatically generated summary.)
+            </p>
+            <p>Subject: Science fiction</p><p>Subject: Monsters -- Fiction</p>
+            </div></content>
+            <rights>Public domain in the USA.</rights></entry>
+        """.trimIndent()
+        val d = GutenbergOpds.parseBook(record)
+        assertEquals("\"Frankenstein\" is a novel & more.", d.summary)
+        assertEquals(listOf("Science fiction", "Monsters"), d.subjects)
+        assertTrue(d.publicDomain)
+        assertFalse(GutenbergOpds.parseBook("<entry><rights>Copyrighted. Read the copyright notice inside this book for details.</rights></entry>").publicDomain)
+    }
+
+    @Test fun lastPageHasNoNextLink() {
+        assertNull(GutenbergOpds.nextUrl("<feed><entry></entry></feed>"))
+    }
+
+    @OptIn(kotlinx.coroutines.DelicateCoroutinesApi::class)
+    @Test fun cancellingABrowseClosesTheConnection() = kotlinx.coroutines.runBlocking {
+        val cancelled = java.util.concurrent.CountDownLatch(1)
+        val http = object : Http() {
+            override fun getText(url: String, timeoutMillis: Int, call: Call?): String {
+                // Simulates a read stuck on a slow server until the call is cancelled.
+                while (call?.cancelled != true) Thread.sleep(5)
+                cancelled.countDown()
+                throw java.net.SocketException("closed")
+            }
+        }
+        val job = kotlinx.coroutines.GlobalScope.launch(kotlinx.coroutines.Dispatchers.Default) { runCatching { FreeBookCatalog(http).browse("slow") } }
+        kotlinx.coroutines.delay(50)
+        job.cancel()
+        assertTrue("connection should be closed promptly", cancelled.await(2, java.util.concurrent.TimeUnit.SECONDS))
     }
 }

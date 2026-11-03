@@ -57,6 +57,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.redirect.data.AppData
 import com.example.redirect.data.BookSource
 import com.example.redirect.data.FreeBook
+import com.example.redirect.data.FreeBookCatalog
+import com.example.redirect.data.FreeBookDetails
 import com.example.redirect.data.FreeBookException
 import com.example.redirect.data.SeedData
 import com.example.redirect.ui.AppActions
@@ -91,13 +93,19 @@ fun DiscoverScreen(vm: AppViewModel, data: AppData, actions: AppActions) {
         value = vm.repo.catalog.search(query).filter { it.source == BookSource.BUNDLED }
     }
     LaunchedEffect(query, retry) {
-        online = OnlineState.Loading
-        if (query.isNotBlank()) delay(500)
-        online = try {
-            val page = vm.repo.freeBooks.browse(query)
-            OnlineState.Loaded(page.books, page.nextUrl, page.source)
+        val catalog = vm.repo.freeBooks
+        // Saved results first, so returning to Discover (or reopening the app) is instant.
+        val cached = catalog.cached(query)
+        online = cached?.let { OnlineState.Loaded(it.page.books, it.page.nextUrl, it.page.source) } ?: OnlineState.Loading
+        if (cached != null && catalog.isFresh(cached) && retry == 0) return@LaunchedEffect
+        // Wait for typing to pause. A new keystroke cancels this effect, which also closes any request in flight.
+        if (query.isNotBlank() && cached == null) delay(350)
+        try {
+            val page = catalog.browse(query)
+            online = OnlineState.Loaded(page.books, page.nextUrl, page.source)
         } catch (e: FreeBookException) {
-            OnlineState.Failed(e.message ?: "Couldn't load books.")
+            // Keep showing saved results if the refresh fails.
+            if (cached == null) online = OnlineState.Failed(e.message ?: "Couldn't load books.")
         }
     }
 
@@ -156,7 +164,7 @@ fun DiscoverScreen(vm: AppViewModel, data: AppData, actions: AppActions) {
                         CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
                         Spacer(Modifier.width(12.dp))
                         Text(
-                            "Searching the catalog. This can take a little while.",
+                            "Searching Project Gutenberg…",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -208,6 +216,7 @@ fun DiscoverScreen(vm: AppViewModel, data: AppData, actions: AppActions) {
 
     details?.let { book ->
         FreeBookSheet(
+            vm.repo.freeBooks,
             book,
             added = book.bookId in inLibrary,
             downloading = book.gutenbergId in downloading,
@@ -296,7 +305,8 @@ private fun FreeBookRow(book: FreeBook, added: Boolean, downloading: Boolean, on
             Row(verticalAlignment = Alignment.CenterVertically) {
                 FreeBookButton(added, downloading, onAction)
                 Spacer(Modifier.width(10.dp))
-                Pill("Public domain", PillTone.Success)
+                // Only claim public domain when the source confirmed it; others are checked on open/download.
+                if (book.rightsVerified) Pill("Public domain", PillTone.Success) else Pill("Project Gutenberg", PillTone.Muted)
             }
         }
     }
@@ -325,8 +335,24 @@ private fun FreeBookButton(added: Boolean, downloading: Boolean, onAction: () ->
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun FreeBookSheet(book: FreeBook, added: Boolean, downloading: Boolean, onDismiss: () -> Unit, onAction: () -> Unit) {
+private fun FreeBookSheet(
+    catalog: FreeBookCatalog, book: FreeBook, added: Boolean, downloading: Boolean, onDismiss: () -> Unit, onAction: () -> Unit,
+) {
     val cover = rememberRemoteCoverPath(book.coverUrl)
+    // Summary, subjects and rights from the book's own record (about 0.2 s; cached).
+    var details by remember(book.gutenbergId) { mutableStateOf<FreeBookDetails?>(null) }
+    var detailsFailed by remember(book.gutenbergId) { mutableStateOf(false) }
+    LaunchedEffect(book.gutenbergId) {
+        try {
+            details = catalog.details(book.gutenbergId)
+        } catch (e: java.io.IOException) {
+            detailsFailed = true
+        }
+    }
+    val summary = book.summary.ifBlank { details?.summary.orEmpty() }
+    val subjects = book.subjects.ifEmpty { details?.subjects.orEmpty() }
+    val publicDomain = book.rightsVerified || details?.publicDomain == true
+    val notPublicDomain = details?.publicDomain == false
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
             Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 24.dp).navigationBarsPadding(),
@@ -339,19 +365,32 @@ private fun FreeBookSheet(book: FreeBook, added: Boolean, downloading: Boolean, 
                     Spacer(Modifier.height(4.dp))
                     Text(book.author, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Spacer(Modifier.height(10.dp))
-                    Pill(if (book.rightsVerified) "Public domain in the USA" else "Rights checked before download", PillTone.Success)
+                    when {
+                        publicDomain -> Pill("Public domain in the USA", PillTone.Success)
+                        notPublicDomain -> Pill("Not public domain", PillTone.Warning)
+                        else -> Pill("Rights checked before download", PillTone.Muted)
+                    }
                 }
             }
-            if (book.subjects.isNotEmpty()) {
+            if (subjects.isNotEmpty()) {
                 Spacer(Modifier.height(16.dp))
-                Text(book.subjects.joinToString(" · "), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(subjects.joinToString(" · "), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            if (book.summary.isNotBlank()) {
+            if (summary.isNotBlank()) {
                 Spacer(Modifier.height(12.dp))
-                Text(book.summary, style = MaterialTheme.typography.bodyMedium)
+                Text(summary, style = MaterialTheme.typography.bodyMedium)
+            } else if (details == null && !detailsFailed && !book.rightsVerified) {
+                Spacer(Modifier.height(12.dp))
+                Text("Loading details…", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Spacer(Modifier.height(20.dp))
-            if (downloading || added) {
+            if (notPublicDomain && !added) {
+                Text(
+                    "Project Gutenberg doesn't list this book as public domain, so Redirect can't offer it as a free download.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else if (downloading || added) {
                 FreeBookButton(added, downloading, onAction, Modifier.fillMaxWidth().height(48.dp))
             } else {
                 Button(onClick = onAction, modifier = Modifier.fillMaxWidth().height(48.dp)) {

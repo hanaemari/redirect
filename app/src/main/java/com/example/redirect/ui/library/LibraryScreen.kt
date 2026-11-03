@@ -109,15 +109,7 @@ fun LibraryScreen(vm: AppViewModel, data: AppData, actions: AppActions) {
         .filter { statusFilter == null || it.status == statusFilter }
         .filter { selectedList == null || it.id in selectedList.bookIds }
         .filter { query.isBlank() || it.title.contains(query.trim(), true) || it.author.contains(query.trim(), true) }
-        .let { list ->
-            when (sort) {
-                SortOrder.RECENT -> list.sortedWith(compareByDescending<Book> { it.lastOpenedAt ?: 0 }.thenByDescending { it.createdAt })
-                SortOrder.ADDED -> list.sortedByDescending { it.createdAt }
-                SortOrder.TITLE -> list.sortedBy { it.title.removePrefix("The ").lowercase() }
-                SortOrder.AUTHOR -> list.sortedBy { it.author.substringAfterLast(' ').lowercase() }
-                SortOrder.PROGRESS -> list.sortedByDescending { it.progress }
-            }
-        }
+        .let { sortBooks(it, sort) }
 
     LazyVerticalGrid(
         columns = if (gridView) GridCells.Adaptive(104.dp) else GridCells.Fixed(1),
@@ -272,6 +264,16 @@ fun LibraryScreen(vm: AppViewModel, data: AppData, actions: AppActions) {
             dismissButton = { TextButton(onClick = { confirmDeleteList = null }) { Text("Cancel") } },
         )
     }
+}
+
+fun sortBooks(list: List<Book>, sort: SortOrder): List<Book> = when (sort) {
+    // 0L, not 0: with an Int fallback, opened (Long) and unopened (Int) books can't be compared
+    // and the Library tab crashed with ClassCastException.
+    SortOrder.RECENT -> list.sortedWith(compareByDescending<Book> { it.lastOpenedAt ?: 0L }.thenByDescending { it.createdAt })
+    SortOrder.ADDED -> list.sortedByDescending { it.createdAt }
+    SortOrder.TITLE -> list.sortedBy { it.title.removePrefix("The ").lowercase() }
+    SortOrder.AUTHOR -> list.sortedBy { it.author.substringAfterLast(' ').lowercase() }
+    SortOrder.PROGRESS -> list.sortedByDescending { it.progress }
 }
 
 val EPUB_TYPES = arrayOf("application/epub+zip", "application/octet-stream")

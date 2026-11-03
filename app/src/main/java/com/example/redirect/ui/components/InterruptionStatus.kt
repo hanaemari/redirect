@@ -17,7 +17,12 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.WarningAmber
 import androidx.compose.material3.Button
+import androidx.compose.material3.Icon
+import androidx.compose.material3.Surface
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.DropdownMenu
@@ -39,6 +44,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.redirect.data.AppData
+import com.example.redirect.interrupt.AccessStatus
 import com.example.redirect.interrupt.InterruptionService
 import com.example.redirect.ui.AppViewModel
 import com.example.redirect.ui.rules.formatTime
@@ -59,11 +65,15 @@ fun interruptionState(data: AppData, serviceEnabled: Boolean, now: Long = System
     }
 }
 
-/** Status of app interruptions with the one action that matters right now. */
+/**
+ * Status of app interruptions with the one action that matters right now. When the permission is
+ * missing, [AccessibilityBanner] takes over instead, so the user isn't shown two prompts.
+ */
 @Composable
-fun InterruptionStatusCard(vm: AppViewModel, data: AppData, modifier: Modifier = Modifier, onSetUp: () -> Unit) {
+fun InterruptionStatusCard(vm: AppViewModel, data: AppData, modifier: Modifier = Modifier) {
     val serviceEnabled by vm.serviceEnabled.collectAsStateWithLifecycle()
     val state = interruptionState(data, serviceEnabled)
+    if (state == InterruptionState.NEEDS_PERMISSION) return
     val extra = LocalExtraColors.current
     val appCount = data.selectedTriggerIds.size
     var pauseMenu by remember { mutableStateOf(false) }
@@ -105,7 +115,7 @@ fun InterruptionStatusCard(vm: AppViewModel, data: AppData, modifier: Modifier =
             Spacer(Modifier.height(12.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 when (state) {
-                    InterruptionState.NEEDS_PERMISSION -> Button(onClick = onSetUp) { Text("Set up") }
+                    InterruptionState.NEEDS_PERMISSION -> Unit
                     InterruptionState.OFF -> FilledTonalButton(onClick = { vm.repo.setInterruptionsEnabled(true) }) { Text("Turn on") }
                     InterruptionState.PAUSED -> FilledTonalButton(onClick = { vm.repo.resumeInterruptions() }) { Text("Resume now") }
                     InterruptionState.ON -> Box {
@@ -158,7 +168,13 @@ fun AccessibilityDisclosure(vm: AppViewModel, modifier: Modifier = Modifier, onS
                 Text("Permission granted. You're ready.", style = MaterialTheme.typography.titleSmall)
             }
         } else {
-            Button(onClick = { openAccessibilitySettings(context) }, modifier = Modifier.fillMaxWidth().height(52.dp)) {
+            Button(
+                onClick = {
+                    vm.repo.updatePreferences { it.copy(accessibilityDisclosureAccepted = true) }
+                    openAccessibilitySettings(context)
+                },
+                modifier = Modifier.fillMaxWidth().height(52.dp),
+            ) {
                 Text("Agree and open settings")
             }
             Spacer(Modifier.height(10.dp))
@@ -192,7 +208,59 @@ private fun DisclosurePoint(title: String, body: String) {
 }
 
 private fun openAccessibilitySettings(context: Context) {
-    runCatching { context.startActivity(InterruptionService.accessibilitySettingsIntent()) }
+    runCatching { context.startActivity(InterruptionService.accessibilitySettingsIntent(context)) }
+}
+
+/**
+ * Persistent prompt shown at the top of Home and Rules while interruptions can't work because the
+ * Accessibility service is off or stopped. Never opens settings by itself; it goes away on its own
+ * once the service is running (status is re-checked on resume and when the setting changes).
+ */
+@Composable
+fun AccessibilityBanner(vm: AppViewModel, data: AppData, modifier: Modifier = Modifier) {
+    val status by vm.accessStatus.collectAsStateWithLifecycle()
+    if (status == AccessStatus.ON) return
+    val context = LocalContext.current
+    var showDisclosure by remember { mutableStateOf(false) }
+    val extra = LocalExtraColors.current
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        color = extra.warningContainer,
+    ) {
+        Column(Modifier.padding(18.dp)) {
+            Row(verticalAlignment = Alignment.Top) {
+                Icon(Icons.Rounded.WarningAmber, null, tint = extra.warning, modifier = Modifier.size(22.dp))
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        if (status == AccessStatus.STOPPED) "App interruption has stopped" else "App interruption is off",
+                        style = MaterialTheme.typography.titleMedium,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        if (status == AccessStatus.STOPPED)
+                            "Android stopped Redirect's Accessibility service. In settings, switch Redirect off and on again to let it replace distracting apps with reading."
+                        else "Enable Accessibility to let Redirect replace distracting apps with reading.",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+            }
+            Spacer(Modifier.height(12.dp))
+            Button(onClick = {
+                // Policy: the disclosure must be accepted once before sending the user to enable it.
+                if (data.preferences.accessibilityDisclosureAccepted) openAccessibilitySettings(context)
+                else showDisclosure = true
+            }) { Text("Enable Accessibility") }
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "In settings, tap “Redirect: app interruptions” (it may be under “Downloaded apps”) and switch it on.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+    if (showDisclosure) AccessibilitySetupSheet(vm, onDismiss = { showDisclosure = false })
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

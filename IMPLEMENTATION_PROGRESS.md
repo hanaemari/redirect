@@ -104,3 +104,36 @@ The project is **not a git repository**. Consider `git init` so future sessions 
 
 ## Next step to resume
 Item 1 above (real-device check), then item 2.
+
+---
+
+## Session 4 (2026-11-02) — stabilization (uncommitted; see `git status`)
+
+### Library tab crash — FIXED
+- Cause (logcat): `ClassCastException: Long cannot be cast to Integer` at `LibraryScreen.kt:114`. "Recently opened" sort used `lastOpenedAt ?: 0` — `Long` for opened books, `Int` 0 for unopened — so any library with both crashed. The crash also made Android mark the Accessibility service "crashed" (looked like a permission reset).
+- Fix: `?: 0L`; sort moved to `sortBooks()` in the same file. Regression test `ui/library/LibrarySortTest` fails on the old code, passes now.
+
+### Discovery speed — DONE
+- Gutenberg OPDS is primary; Gutendex is the fallback. Summary/subjects/rights come from the book's `{id}.opds` record (details sheet + rights check before download). List rows say "Public domain" only when verified.
+- Disk + memory cache of first pages (`cacheDir/discover`, 6 h fresh, 20 queries); cached results show instantly. Requests are cancellable (connection closed on cancel). Timeouts: connect 8 s, OPDS read 10 s, Gutendex read 15 s.
+- Measured (curl): Gutendex 62 s / 89 s (503) / 60 s timeouts on uncached queries; OPDS 0.2–0.9 s. App code path (`DiscoveryLatencyProbe`, run with `-Pprobe`): before 0.07–25.4 s (uncached searches 15.6 s, 25.3 s); after 0.08–0.64 s.
+
+### Accessibility banner — DONE
+- `AccessibilityBanner` at top of Home and Rules while the service is OFF or STOPPED (enabled in Settings but not running, e.g. after a crash; re-checked after 3 s). Live via resume, a Settings ContentObserver, and the service's `runningState`.
+- "Enable Accessibility" opens Accessibility settings with Redirect highlighted (`:settings:fragment_args_key`; the per-service details action is system-only). The disclosure sheet shows first unless already accepted (`accessibilityDisclosureAccepted`).
+- Fixed in verification: on Home the banner was inserted as a separate list item and stayed scrolled off-screen when it appeared while open; now it shares the first item with the greeting.
+
+### Verified on emulator (API 36)
+- Library with opened + unopened books opens; grid/list, all sort orders, 40+ tab switches, reader and Discover round trips: no crash.
+- Banner: shown when off → disclosure → settings (Redirect highlighted) → enable via system dialog → banner gone; revoked while app open → banner back.
+- Discover loads from Gutenberg OPDS.
+- Tests: 52 passed, 1 skipped (network probe).
+
+### Not tested / remaining
+- Not re-run this session: interruption flow, continue/bypass, pause options, EPUB import, downloads end to end, custom/external-app rules (code paths unchanged).
+- STOPPED banner state not reproduced on the emulator.
+- Library "Add a book" sheet subtitle still says "sample listings" (stale copy).
+- Emulator under host memory pressure caused system-wide ANRs (not Redirect-specific).
+
+### Next step
+Phone checks for the items above, then commit. After that: scroll-aware / link-aware interruption (not started).

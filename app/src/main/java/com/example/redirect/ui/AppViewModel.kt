@@ -1,7 +1,11 @@
 package com.example.redirect.ui
 
 import android.app.Application
+import android.database.ContentObserver
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
+import android.provider.Settings
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.redirect.RedirectApp
@@ -14,9 +18,15 @@ import com.example.redirect.data.ImportResult
 import com.example.redirect.data.isAvailable
 import com.example.redirect.engine.RedirectDecision
 import com.example.redirect.engine.RuleEngine
+import com.example.redirect.interrupt.AccessStatus
 import com.example.redirect.interrupt.InterruptionService
 import com.example.redirect.platform.InstalledApp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -54,12 +64,56 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _pendingInterruption.value = null
     }
 
-    private val _serviceEnabled = MutableStateFlow(InterruptionService.isEnabled(app))
-    /** Whether the interruption service is switched on in Accessibility settings. */
-    val serviceEnabled: StateFlow<Boolean> = _serviceEnabled.asStateFlow()
+    // Optimistic start: a just-started process may not have its service re-bound yet (see refresh).
+    private val _accessStatus = MutableStateFlow(if (InterruptionService.isEnabled(app)) AccessStatus.ON else AccessStatus.OFF)
+    /** Actual Accessibility state of the interruption service, kept live (see init). */
+    val accessStatus: StateFlow<AccessStatus> = _accessStatus.asStateFlow()
+
+    /** Whether interruptions can work: the service is switched on and running. */
+    val serviceEnabled: StateFlow<Boolean> = accessStatus.map { it == AccessStatus.ON }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, _accessStatus.value == AccessStatus.ON)
+
+    private var recheck: Job? = null
 
     fun refreshInterruptionStatus() {
-        _serviceEnabled.value = InterruptionService.isEnabled(getApplication())
+        recheck?.cancel()
+        val status = InterruptionService.accessStatus(getApplication())
+        if (status != AccessStatus.STOPPED) {
+            publishAccessStatus(status)
+            return
+        }
+        // Right after it's switched on (or the app starts) Android may still be binding the
+        // service, so only report "stopped" if it stays that way.
+        recheck = viewModelScope.launch {
+            delay(3_000)
+            publishAccessStatus(InterruptionService.accessStatus(getApplication()))
+        }
+    }
+
+    private fun publishAccessStatus(status: AccessStatus) {
+        _accessStatus.value = status
+        // Turning it on means the user went through the disclosure; later prompts can go straight to settings.
+        val prefs = repo.store.data.value?.preferences
+        if (status == AccessStatus.ON && prefs != null && !prefs.accessibilityDisclosureAccepted) {
+            repo.updatePreferences { it.copy(accessibilityDisclosureAccepted = true) }
+        }
+    }
+
+    // Catch changes made while the app is open too (e.g. revoked from quick settings), not only on resume.
+    private val accessibilityObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
+        override fun onChange(selfChange: Boolean) = refreshInterruptionStatus()
+    }
+
+    init {
+        val resolver = app.contentResolver
+        resolver.registerContentObserver(Settings.Secure.getUriFor(Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES), false, accessibilityObserver)
+        resolver.registerContentObserver(Settings.Secure.getUriFor(Settings.Secure.ACCESSIBILITY_ENABLED), false, accessibilityObserver)
+        // The service connecting or disconnecting in this process.
+        viewModelScope.launch { InterruptionService.runningState.collect { refreshInterruptionStatus() } }
+    }
+
+    override fun onCleared() {
+        getApplication<Application>().contentResolver.unregisterContentObserver(accessibilityObserver)
     }
 
     fun toast(message: String) {

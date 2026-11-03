@@ -1,6 +1,8 @@
 package com.example.redirect.data
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asExecutor
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -12,6 +14,7 @@ import java.net.URL
 import java.net.URLEncoder
 
 /** A public-domain book that can be downloaded from Project Gutenberg. */
+@Serializable
 data class FreeBook(
     val gutenbergId: Int,
     val title: String,
@@ -32,70 +35,127 @@ data class FreeBook(
     }
 }
 
+@Serializable
 data class FreeBookPage(val books: List<FreeBook>, val nextUrl: String?, val source: String)
+
+/** Extra metadata from a book's own Gutenberg record, fetched when its details are opened. */
+data class FreeBookDetails(val summary: String, val subjects: List<String>, val publicDomain: Boolean)
+
+/** A first page of results saved earlier, shown instantly while a refresh runs. */
+@Serializable
+data class CachedPage(val page: FreeBookPage, val savedAt: Long)
 
 class FreeBookException(message: String) : Exception(message)
 
 class TooLargeException(url: String) : IOException("File is too large: $url")
 
 /**
- * Project Gutenberg discovery. Gutendex (https://gutendex.com) is the primary source because it
- * returns rights, summaries and formats as JSON. It is a free community service and was measured
- * at 15–74 s per request, so on timeout or error we fall back to Gutenberg's own OPDS catalog,
- * which is fast but sparse; books found that way have their rights checked before download.
+ * Project Gutenberg discovery.
+ *
+ * Gutenberg's own OPDS catalog is the primary source: measured at 0.2–0.4 s per request, versus
+ * Gutendex at 62–90 s (and HTTP 503s) whenever it hasn't recently served the same query. OPDS search
+ * results carry only title/author, so summaries and the public-domain check come from each book's
+ * own record ([details]) when it is opened or downloaded. Gutendex stays as the fallback if
+ * gutenberg.org is unreachable.
+ *
+ * First pages are cached in memory and on disk ([cached]) so repeat visits are instant. Requests
+ * are cancellable: leaving Discover or typing a new query closes the old connection.
  */
 class FreeBookCatalog(
     private val http: Http = Http(),
+    /** Where first pages are saved between launches; null disables the disk cache. */
+    private val cacheDir: File? = null,
+    private val clock: () -> Long = System::currentTimeMillis,
 ) {
-    /** Recent first pages, so returning to Discover doesn't wait on the network again. */
-    private val cache = object : LinkedHashMap<String, FreeBookPage>(16, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, FreeBookPage>?) = size > 12
+    private val json = Json { ignoreUnknownKeys = true }
+
+    private val memory = object : LinkedHashMap<String, CachedPage>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedPage>?) = size > MAX_CACHED_QUERIES
+    }
+    private val detailsCache = java.util.concurrent.ConcurrentHashMap<Int, FreeBookDetails>()
+
+    /** The last saved first page for [query], if any. Doesn't touch the network. */
+    suspend fun cached(query: String): CachedPage? = withContext(Dispatchers.IO) {
+        val key = keyFor(query)
+        synchronized(memory) { memory[key] }?.let { return@withContext it }
+        val file = cacheFile(key) ?: return@withContext null
+        val saved = runCatching { json.decodeFromString<CachedPage>(file.readText()) }.getOrNull() ?: return@withContext null
+        synchronized(memory) { memory[key] = saved }
+        saved
     }
 
-    suspend fun browse(query: String): FreeBookPage = withContext(Dispatchers.IO) {
+    fun isFresh(cached: CachedPage): Boolean = clock() - cached.savedAt in 0 until FRESH_FOR_MS
+
+    /** Fetches the first page for [query] from the network and saves it. */
+    suspend fun browse(query: String): FreeBookPage {
         val q = query.trim()
-        synchronized(cache) { cache[q.lowercase()] }?.let { return@withContext it }
-        val url = buildString {
-            append("https://gutendex.com/books/?copyright=false&mime_type=application%2Fepub")
-            if (q.isNotEmpty()) append("&search=").append(URLEncoder.encode(q, "UTF-8"))
-        }
         val page = try {
-            fetchGutendex(url)
+            fetchOpds(opdsSearchUrl(q))
         } catch (e: IOException) {
-            fallbackSearch(q)
+            try {
+                fetchGutendex(gutendexUrl(q))
+            } catch (e2: IOException) {
+                throw FreeBookException("Couldn't reach Project Gutenberg. Check your connection and try again.")
+            }
         }
-        synchronized(cache) { cache[q.lowercase()] = page }
-        page
+        save(keyFor(q), CachedPage(page, clock()))
+        return page
     }
 
-    suspend fun nextPage(nextUrl: String): FreeBookPage = withContext(Dispatchers.IO) {
-        try {
-            fetchGutendex(nextUrl)
-        } catch (e: IOException) {
-            throw FreeBookException("Couldn't load more books. Check your connection and try again.")
-        }
+    suspend fun nextPage(nextUrl: String): FreeBookPage = try {
+        if ("gutendex.com" in nextUrl) fetchGutendex(nextUrl) else fetchOpds(nextUrl)
+    } catch (e: IOException) {
+        throw FreeBookException("Couldn't load more books. Check your connection and try again.")
     }
 
-    private fun fetchGutendex(url: String): FreeBookPage {
-        val body = http.getText(url, timeoutMillis = GUTENDEX_TIMEOUT_MS)
-        return Gutendex.parse(body)
-    }
-
-    private fun fallbackSearch(q: String): FreeBookPage {
-        val url = if (q.isEmpty()) "https://www.gutenberg.org/ebooks/search.opds/?sort_order=downloads"
-        else "https://www.gutenberg.org/ebooks/search.opds/?query=${URLEncoder.encode(q, "UTF-8")}"
-        val body = try {
-            http.getText(url, timeoutMillis = OPDS_TIMEOUT_MS)
-        } catch (e: IOException) {
-            throw FreeBookException("Couldn't reach Project Gutenberg. Check your connection and try again.")
-        }
-        return FreeBookPage(GutenbergOpds.parseSearch(body), nextUrl = null, source = "Project Gutenberg")
+    /** Summary, subjects and rights from the book's own Gutenberg record (cached in memory). */
+    suspend fun details(gutenbergId: Int): FreeBookDetails {
+        detailsCache[gutenbergId]?.let { return it }
+        val body = fetchText("https://www.gutenberg.org/ebooks/$gutenbergId.opds", OPDS_TIMEOUT_MS)
+        return GutenbergOpds.parseBook(body).also { detailsCache[gutenbergId] = it }
     }
 
     /** Confirms a book is public domain in the USA according to Project Gutenberg's own record. */
-    suspend fun verifyRights(gutenbergId: Int): Boolean = withContext(Dispatchers.IO) {
-        val body = http.getText("https://www.gutenberg.org/ebooks/$gutenbergId.opds", timeoutMillis = OPDS_TIMEOUT_MS)
-        GutenbergOpds.isPublicDomain(body)
+    suspend fun verifyRights(gutenbergId: Int): Boolean = details(gutenbergId).publicDomain
+
+    private suspend fun fetchOpds(url: String): FreeBookPage {
+        val body = fetchText(url, OPDS_TIMEOUT_MS)
+        return FreeBookPage(GutenbergOpds.parseSearch(body), GutenbergOpds.nextUrl(body), source = "Project Gutenberg")
+    }
+
+    private suspend fun fetchGutendex(url: String): FreeBookPage =
+        Gutendex.parse(fetchText(url, GUTENDEX_TIMEOUT_MS))
+
+    /**
+     * Runs a blocking request off the main thread. Cancelling the coroutine closes the connection;
+     * plain coroutine cancellation can't interrupt a blocked HttpURLConnection read.
+     */
+    private suspend fun fetchText(url: String, timeoutMillis: Int): String = suspendCancellableCoroutine { cont ->
+        val call = Http.Call()
+        cont.invokeOnCancellation { call.cancel() }
+        Dispatchers.IO.asExecutor().execute {
+            // Resuming an already-cancelled continuation is ignored.
+            cont.resumeWith(runCatching { http.getText(url, timeoutMillis, call) })
+        }
+    }
+
+    private fun keyFor(query: String) = query.trim().lowercase()
+
+    private fun cacheFile(key: String): File? =
+        cacheDir?.let { File(it, "q-${key.hashCode().toUInt()}.json") }?.takeIf { it.exists() }
+
+    private suspend fun save(key: String, cached: CachedPage) = withContext(Dispatchers.IO) {
+        synchronized(memory) { memory[key] = cached }
+        val dir = cacheDir ?: return@withContext
+        runCatching {
+            dir.mkdirs()
+            val tmp = File(dir, "q-${key.hashCode().toUInt()}.json.tmp")
+            tmp.writeText(json.encodeToString(CachedPage.serializer(), cached))
+            tmp.renameTo(File(dir, "q-${key.hashCode().toUInt()}.json"))
+            // Keep the cache small: only the most recent queries.
+            dir.listFiles { f -> f.name.endsWith(".json") }?.sortedByDescending { it.lastModified() }
+                ?.drop(MAX_CACHED_QUERIES)?.forEach { it.delete() }
+        }
     }
 
     /**
@@ -116,10 +176,23 @@ class FreeBookCatalog(
     }
 
     companion object {
-        const val GUTENDEX_TIMEOUT_MS = 25_000
-        const val OPDS_TIMEOUT_MS = 15_000
+        /** Read timeouts; connecting is capped separately by [Http.CONNECT_TIMEOUT_MS]. */
+        const val OPDS_TIMEOUT_MS = 10_000
+        const val GUTENDEX_TIMEOUT_MS = 15_000
+        /** Cached results younger than this are shown without asking the network again. */
+        const val FRESH_FOR_MS = 6 * 60 * 60 * 1000L
+        const val MAX_CACHED_QUERIES = 20
         const val MAX_EPUB_BYTES = 100L * 1024 * 1024
         const val MAX_ILLUSTRATED_BYTES = 15L * 1024 * 1024
+
+        fun opdsSearchUrl(q: String) =
+            if (q.isEmpty()) "https://www.gutenberg.org/ebooks/search.opds/?sort_order=downloads"
+            else "https://www.gutenberg.org/ebooks/search.opds/?query=${URLEncoder.encode(q, "UTF-8")}"
+
+        fun gutendexUrl(q: String) = buildString {
+            append("https://gutendex.com/books/?copyright=false&mime_type=application%2Fepub")
+            if (q.isNotEmpty()) append("&search=").append(URLEncoder.encode(q, "UTF-8"))
+        }
 
         fun epubUrlFor(id: Int) = "https://www.gutenberg.org/ebooks/$id.epub3.images"
         fun textOnlyUrlFor(id: Int) = "https://www.gutenberg.org/ebooks/$id.epub.noimages"
@@ -185,6 +258,9 @@ object GutenbergOpds {
     private val contentRegex = Regex("<content type=\"text\">(.*?)</content>", RegexOption.DOT_MATCHES_ALL)
     private val downloadsRegex = Regex("""[\d,]+ downloads?""")
     private val rightsRegex = Regex("<rights>(.*?)</rights>", RegexOption.DOT_MATCHES_ALL)
+    private val nextRegex = Regex("<link[^>]*rel=\"next\"[^>]*href=\"([^\"]+)\"")
+    private val summaryRegex = Regex("<p>\\s*Summary:\\s*(.*?)</p>", RegexOption.DOT_MATCHES_ALL)
+    private val subjectRegex = Regex("<p>Subject: (.*?)</p>")
 
     fun parseSearch(body: String): List<FreeBook> = entryRegex.findAll(body).mapNotNull { m ->
         val entry = m.groupValues[1]
@@ -201,6 +277,19 @@ object GutenbergOpds {
             rightsVerified = false,
         )
     }.distinctBy { it.gutenbergId }.toList()
+
+    /** Absolute URL of the next results page, or null on the last page. */
+    fun nextUrl(body: String): String? = nextRegex.find(body)?.groupValues?.get(1)?.let { href ->
+        URL(URL("https://www.gutenberg.org/"), unescape(href)).toString()
+    }
+
+    /** Fields of a single book's record (`/ebooks/{id}.opds`). */
+    fun parseBook(body: String) = FreeBookDetails(
+        summary = summaryRegex.find(body)?.groupValues?.get(1)?.let(::unescape)
+            ?.replace(Regex("\\s+"), " ")?.trim()?.removeSuffix("(This is an automatically generated summary.)")?.trim().orEmpty(),
+        subjects = subjectRegex.findAll(body).map { unescape(it.groupValues[1]).substringBefore(" -- ") }.distinct().take(4).toList(),
+        publicDomain = isPublicDomain(body),
+    )
 
     fun isPublicDomain(body: String): Boolean =
         rightsRegex.find(body)?.groupValues?.get(1)?.contains("public domain", ignoreCase = true) == true
@@ -220,8 +309,25 @@ fun displayAuthor(name: String): String {
 
 /** Tiny HTTP helper over HttpURLConnection, to avoid pulling in an HTTP library. */
 open class Http {
-    open fun getText(url: String, timeoutMillis: Int): String {
-        val conn = open(url, timeoutMillis)
+    /** Lets another thread abort a request by closing its connection. */
+    class Call {
+        @Volatile private var conn: HttpURLConnection? = null
+        @Volatile var cancelled = false
+            private set
+
+        fun cancel() {
+            cancelled = true
+            conn?.disconnect()
+        }
+
+        internal fun attach(c: HttpURLConnection) {
+            conn = c
+            if (cancelled) c.disconnect()
+        }
+    }
+
+    open fun getText(url: String, timeoutMillis: Int, call: Call? = null): String {
+        val conn = open(url, timeoutMillis, call)
         try {
             val code = conn.responseCode
             if (code !in 200..299) throw IOException("HTTP $code for $url")
@@ -261,16 +367,18 @@ open class Http {
         }
     }
 
-    private fun open(url: String, timeoutMillis: Int): HttpURLConnection {
+    private fun open(url: String, timeoutMillis: Int, call: Call? = null): HttpURLConnection {
         var current = URL(url)
         // HttpURLConnection doesn't follow http→https redirects, so follow a few by hand.
         repeat(5) {
+            if (call?.cancelled == true) throw IOException("Cancelled")
             val conn = (current.openConnection() as HttpURLConnection).apply {
-                connectTimeout = 15_000
+                connectTimeout = CONNECT_TIMEOUT_MS
                 readTimeout = timeoutMillis
                 instanceFollowRedirects = false
                 setRequestProperty("User-Agent", "Redirect-Android/0.1 (personal reading app)")
             }
+            call?.attach(conn)
             val code = conn.responseCode
             if (code in 300..399) {
                 val location = conn.getHeaderField("Location") ?: return conn
@@ -281,5 +389,9 @@ open class Http {
             }
         }
         throw IOException("Too many redirects for $url")
+    }
+
+    companion object {
+        const val CONNECT_TIMEOUT_MS = 8_000
     }
 }

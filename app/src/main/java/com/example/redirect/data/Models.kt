@@ -46,6 +46,8 @@ data class UserPreferences(
     val interruptionsEnabled: Boolean = true,
     /** Interruptions are suspended until this time (epoch millis). */
     val interruptionsPausedUntil: Long? = null,
+    /** The user agreed to the Accessibility disclosure, so prompts may open settings directly. */
+    val accessibilityDisclosureAccepted: Boolean = false,
 )
 
 @Serializable

@@ -525,7 +525,7 @@ private fun DonePage(vm: AppViewModel, appCount: Int, style: RedirectStyle, star
                     }
                 )
                 SummaryLine("Style: ${style.label()}")
-                if (appCount > 0 && !serviceEnabled) SummaryLine("Interruptions start once you allow the permission (Home → Set up)")
+                if (appCount > 0 && !serviceEnabled) SummaryLine("Interruptions start once you enable Accessibility (Home → Enable Accessibility)")
                 SummaryLine(starterTitle?.let { "Starting with $it" } ?: "Your library is ready when you are")
             }
         }

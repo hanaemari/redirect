@@ -25,7 +25,7 @@ class AppRepository(
     val installedApps: InstalledApps,
     private val bridge: RedirectionBridge,
     val catalog: BookCatalog = LocalSampleCatalog(),
-    val freeBooks: FreeBookCatalog = FreeBookCatalog(),
+    val freeBooks: FreeBookCatalog = FreeBookCatalog(cacheDir = File(context.cacheDir, "discover")),
 ) {
     private val booksDir = File(context.filesDir, "books").apply { mkdirs() }
     private val coversDir = File(context.filesDir, "covers").apply { mkdirs() }
@@ -240,9 +240,12 @@ class AppRepository(
                             updateBook(book.id) { it.copy(coverPath = cover.absolutePath) }
                         }
                     }
-                    if (book.description.isBlank() && free.summary.isNotBlank()) {
-                        book = book.copy(description = free.summary)
-                        updateBook(book.id) { it.copy(description = free.summary) }
+                    // Catalog listings may lack a summary; the book's own record (already fetched for
+                    // the rights check or the details sheet) usually has one.
+                    val summary = free.summary.ifBlank { runCatching { freeBooks.details(free.gutenbergId).summary }.getOrDefault("") }
+                    if (book.description.isBlank() && summary.isNotBlank()) {
+                        book = book.copy(description = summary)
+                        updateBook(book.id) { it.copy(description = summary) }
                     }
                     ImportResult.Success(book)
                 }

@@ -1,6 +1,6 @@
 package com.example.redirect.ui.home
 
-import com.example.redirect.ui.components.AccessibilitySetupSheet
+import com.example.redirect.ui.components.AccessibilityBanner
 import com.example.redirect.ui.components.InterruptionStatusCard
 
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -97,14 +97,19 @@ fun HomeScreen(vm: AppViewModel, data: AppData, actions: AppActions) {
     val launchImport = { picker.launch(arrayOf("application/epub+zip", "application/octet-stream")) }
     val current = data.currentBook
     val library = data.libraryBooks
-    var showSetup by remember { mutableStateOf(false) }
-    if (showSetup) AccessibilitySetupSheet(vm, onDismiss = { showSetup = false })
 
     LazyColumn(
         Modifier.fillMaxSize().statusBarsPadding(),
         contentPadding = PaddingValues(bottom = 32.dp),
     ) {
-        item { Greeting(data) }
+        // One item: if the banner were its own item, appearing while the list is open would insert it
+        // above the visible first item, and the list would keep that item anchored, leaving the banner off-screen.
+        item {
+            Column {
+                AccessibilityBanner(vm, data, Modifier.padding(start = 20.dp, end = 20.dp, top = 16.dp))
+                Greeting(data)
+            }
+        }
 
         if (library.isEmpty()) {
             item {
@@ -127,7 +132,7 @@ fun HomeScreen(vm: AppViewModel, data: AppData, actions: AppActions) {
 
         item {
             Spacer(Modifier.height(12.dp))
-            InterruptionStatusCard(vm, data, Modifier.padding(horizontal = 20.dp), onSetUp = { showSetup = true })
+            InterruptionStatusCard(vm, data, Modifier.padding(horizontal = 20.dp))
         }
 
         data.preferences.readingIntentionMinutes?.let { goal ->

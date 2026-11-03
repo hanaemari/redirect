@@ -40,6 +40,10 @@ android {
         compose = true
         buildConfig = true
     }
+    testOptions {
+        // `-Pprobe` enables the real-network DiscoveryLatencyProbe (skipped otherwise).
+        unitTests.all { it.systemProperty("probe", if (project.hasProperty("probe")) "true" else "false") }
+    }
     androidResources {
         // Bundled EPUBs are already zip-compressed.
         noCompress += "epub"
